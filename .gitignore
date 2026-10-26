@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.elc
+*.eln
+*~
+.venv/
+venv/
+dictionaries/
+models/
+.env
+.env.*
+!.env.example
+test-results/
+.DS_Store
+Thumbs.db

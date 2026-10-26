@@ -1,0 +1,113 @@
+;;; crosslang-style-tests.el --- Theme distinction without editor interference -*- lexical-binding: t; -*-
+(require 'ert)
+(require 'crosslang-pair)
+
+(defmacro crosslang-style-test--with (&rest body)
+  `(with-temp-buffer
+     (text-mode) (buffer-enable-undo) (insert "中文\nEnglish") (crosslang-mode 1)
+     (unwind-protect (progn ,@body) (crosslang-mode -1))))
+
+(ert-deftest crosslang-style-decoration-never-modifies-buffer-or-undo ()
+  (crosslang-style-test--with
+    (let ((text (buffer-string)) (undo buffer-undo-list) (tick (buffer-chars-modified-tick))
+          (modified (buffer-modified-p)) (position (point)) (windows (current-window-configuration)))
+      (crosslang-style-region 4 (point-max))
+      (should (equal-including-properties text (buffer-string)))
+      (should (equal undo buffer-undo-list))
+      (should (= tick (buffer-chars-modified-tick)))
+      (should (eq modified (buffer-modified-p)))
+      (should (= position (point)))
+      (should (compare-window-configurations windows (current-window-configuration)))
+      (should (= (length crosslang-style--overlays) 1))
+      (crosslang-style-clear)
+      (should (equal-including-properties text (buffer-string)))
+      (should-not crosslang-style--overlays))))
+
+(ert-deftest crosslang-style-face-has-no-layout-or-editing-properties ()
+  (crosslang-style-test--with
+    (crosslang-style-region 4 (point-max))
+    (let ((overlay (car crosslang-style--overlays)))
+      (should (eq (overlay-get overlay 'face) 'crosslang-translation-face))
+      (dolist (property '(display before-string after-string keymap read-only invisible mouse-face))
+        (should-not (overlay-get overlay property))))
+    (should (eq (face-attribute 'crosslang-shadow-face :inherit) 'crosslang-translation-face))
+    (dolist (attribute '(:height :family :box :background))
+      (should (eq (face-attribute 'crosslang-translation-face attribute) 'unspecified)))))
+
+(ert-deftest crosslang-style-confirmed-bilingual-only-colors-target ()
+  (crosslang-style-test--with
+    (erase-buffer) (insert "日期")
+    (crosslang--show (list :operation 'express :text "日期" :start 1 :end 3 :tick (buffer-chars-modified-tick))
+                    '(:text "date"))
+    (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) t))) (crosslang-insert-bilingual))
+    (should (equal (buffer-string) "日期\ndate"))
+    (let ((overlay (car crosslang-style--overlays)))
+      (should (= (overlay-start overlay) 4))
+      (should (equal (buffer-substring-no-properties (overlay-start overlay) (overlay-end overlay)) "date")))
+    (undo-only 1)
+    (should (equal (buffer-string) "日期"))
+    (should-not crosslang-style--overlays)))
+
+(ert-deftest crosslang-style-partial-edits-track-shifting-positions ()
+  (crosslang-style-test--with
+    (erase-buffer) (insert "API 日期 v2 预算")
+    (crosslang--show (list :operation 'express :text (buffer-string) :start 1 :end (point-max)
+                          :tick (buffer-chars-modified-tick))
+                     '(:text "API date v2 budget" :edits ((:start 4 :end 6 :text "date") (:start 10 :end 12 :text "budget"))))
+    (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) t))) (crosslang-accept))
+    (should (equal (buffer-string) "API date v2 budget"))
+    (should (equal (sort (mapcar (lambda (overlay) (buffer-substring-no-properties
+                                (overlay-start overlay) (overlay-end overlay))) crosslang-style--overlays) #'string<)
+                   '("budget" "date")))))
+
+(ert-deftest crosslang-style-manual-edit-removes-only-that-region ()
+  (crosslang-style-test--with
+    (crosslang-style-region 1 3) (crosslang-style-region 4 (point-max))
+    (goto-char 5) (insert "X")
+    (should (= (length crosslang-style--overlays) 1))
+    (should (= (overlay-start (car crosslang-style--overlays)) 1))
+    (let ((text (buffer-string)))
+      (crosslang-mode -1)
+      (should (equal text (buffer-string)))
+      (should-not crosslang-style--overlays))))
+
+(ert-deftest crosslang-style-details-distinguish-target-only ()
+  (with-temp-buffer
+    (crosslang-ui-insert-details '(:operation express :text "Hello") '(:text "你好") nil nil)
+    (goto-char (point-min)) (search-forward "Hello")
+    (should-not (get-text-property (1- (point)) 'face))
+    (search-forward "你好")
+    (should (eq (get-text-property (1- (point)) 'face) 'crosslang-translation-face))))
+
+(ert-deftest crosslang-style-aborted-transaction-has-no-new-decoration ()
+  (crosslang-style-test--with
+    (should-error (crosslang-style-transaction (crosslang-style-note-region 4 (point-max)) (error "aborted")))
+    (should-not crosslang-style--overlays)
+    (should-not crosslang-style--pending)))
+
+(ert-deftest crosslang-style-pair-refresh-and-stop-own-only-one-overlay ()
+  (with-temp-buffer
+    (fundamental-mode) (insert "日期")
+    (setq-local crosslang-provider (list :operations '(express)
+      :start (lambda (request done)
+               (let* ((span (car (plist-get request :spans)))
+                      (text (if (string-match-p "更新" (plist-get request :text)) "updated date" "date")))
+                 (funcall done (list :text text :edits (list (list :start (plist-get span :start)
+                                                           :end (plist-get span :end) :text text))))) nil)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'crosslang-live--focused-p) (lambda () t))
+                  ((symbol-function 'crosslang-live--composing-p) (lambda () nil)))
+          (crosslang-pair-mode 1)
+          (dotimes (revision 2)
+            (when (= revision 1) (insert "更新"))
+            (cancel-timer crosslang-live--timer)
+            (crosslang-live--fire (current-buffer) crosslang-live--epoch (buffer-chars-modified-tick))
+            (should (= (length crosslang-style--overlays) 1))
+            (should (equal (buffer-substring-no-properties (overlay-start (car crosslang-style--overlays))
+                                                          (overlay-end (car crosslang-style--overlays)))
+                           crosslang-pair--last-target)))
+          (let ((text (buffer-string)))
+            (crosslang-pair-mode -1)
+            (should-not crosslang-style--overlays)
+            (should (equal text (buffer-string)))))
+      (crosslang-pair-mode -1) (crosslang-mode -1))))

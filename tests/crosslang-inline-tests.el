@@ -1,0 +1,126 @@
+;;; crosslang-inline-tests.el --- Communication flow acceptance -*- lexical-binding: t; -*-
+(require 'ert)
+(require 'crosslang-gptel)
+(require 'crosslang-local)
+
+(defun crosslang-inline-test--provider (request done)
+  (let ((text (plist-get request :text)) edits)
+    (dolist (span (reverse (copy-sequence (plist-get request :spans))))
+      (let ((start (plist-get span :start)) (end (plist-get span :end)))
+        (push (list :start start :end end :text "the delivery date; budget must not exceed") edits)
+        (setq text (concat (substring text 0 start) "the delivery date; budget must not exceed" (substring text end)))))
+    (funcall done (list :text text :edits edits :source "test-provider"))))
+
+(ert-deftest crosslang-inline-no-window-or-text-or-undo-change ()
+  (with-temp-buffer
+    (text-mode) (buffer-enable-undo)
+    (insert "Please check 交付时间，预算不要超过 50 USD.")
+    (crosslang-mode 1)
+    (setq-local crosslang-provider (list :operations '(express) :start #'crosslang-inline-test--provider))
+    (let ((windows (current-window-configuration)) (text (buffer-string)) (undo buffer-undo-list)
+          (crosslang-presentation 'inline) (transient-mark-mode t))
+      (goto-char (point-min)) (set-mark (point)) (goto-char (point-max)) (setq mark-active t)
+      (unwind-protect
+          (progn
+            (crosslang-express)
+            (should (equal text (buffer-string))) (should (equal undo buffer-undo-list))
+            (should (compare-window-configurations windows (current-window-configuration)))
+            (should-not crosslang--preview)
+            (should (cl-some #'overlay-buffer crosslang--overlays))
+            (should (equal "Please check the delivery date; budget must not exceed 50 USD."
+                           (plist-get (plist-get crosslang--proposal :response) :text)))
+            (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) t))) (crosslang-accept))
+            (should (string-prefix-p "Please check " (buffer-string)))
+            (should (string-suffix-p " 50 USD." (buffer-string)))
+            (should-not crosslang--overlays)
+            (undo-only 1) (should (equal text (buffer-string))))
+        (crosslang-mode -1)))))
+
+(ert-deftest crosslang-inline-edit-clears-result-immediately ()
+  (with-temp-buffer
+    (text-mode) (insert "原文") (crosslang-mode 1)
+    (crosslang--show (list :operation 'express :text "原文" :start 1 :end 3)
+                     '(:text "original"))
+    (add-hook 'before-change-functions #'crosslang--changed nil t)
+    (insert "x")
+    (should-not crosslang--overlays) (should-not crosslang--proposal)
+    (crosslang-mode -1)))
+
+(ert-deftest crosslang-inline-reading-at-point-and-streaming-continue ()
+  (with-temp-buffer
+    (insert "subject to approval") (goto-char 3) (crosslang-mode 1)
+    (let (callback selected)
+      (setq-local crosslang-provider
+                  (list :operations '(explain) :start (lambda (request done)
+                                                       (setq callback done selected (plist-get request :text)) nil)))
+      (crosslang-explain)
+      (should (equal "subject" selected))
+      (goto-char (point-max)) (insert "\nAgent keeps streaming")
+      (funcall callback '(:text "须经批准；取决于"))
+      (should crosslang--overlays)
+      (should (string-match-p "Agent keeps streaming" (buffer-string)))
+      (crosslang-mode -1)
+      (should-not crosslang--overlays))))
+
+(ert-deftest crosslang-inline-context-is-response-only-bounded-and-optional ()
+  (require 'gptel)
+  (with-temp-buffer
+    (org-mode) (gptel-mode 1)
+    (insert (gptel-prompt-prefix-string) "old request\n")
+    (insert (propertize (make-string 1900 ?a) 'gptel 'response))
+    (insert (propertize "SECRET TOOL OUTPUT" 'gptel 'tool))
+    (insert "\n" (gptel-prompt-prefix-string) "请解释它")
+    (let* ((bounds (crosslang-gptel--bounds)) (context (crosslang--context bounds)))
+      (should (= 1500 (length context)))
+      (should-not (string-match-p "SECRET" context))
+      (let ((crosslang-context-enabled nil)) (should-not (crosslang--context bounds))))
+    (gptel-mode -1)))
+
+(ert-deftest crosslang-inline-out-of-scope-edits-rejected ()
+  (should-not (crosslang--valid-edits-p "API 不变" '((:start 4 :end 6))
+                                          '(:text "HACK" :edits ((:start 0 :end 6 :text "HACK"))))))
+
+(ert-deftest crosslang-inline-voluntary-review-blocks-hints-until-finished ()
+  (with-temp-buffer
+    (text-mode) (insert "独立表达") (crosslang-mode 1)
+    (crosslang-review-start "表达")
+    (should-error (crosslang--request 'express (cons 1 5) t) :type 'user-error)
+    (crosslang-review-finish "自行修正后完成" nil)
+    (should-not crosslang--review)
+    (should (plist-get (car crosslang-review-results) :unassisted))
+    (should (eq crosslang-assistance 'on-demand))
+    (crosslang-mode -1)))
+
+(ert-deftest crosslang-inline-details-are-explicit-and-dismiss-cleans-both ()
+  (with-temp-buffer
+    (crosslang-mode 1)
+    (crosslang--show '(:operation explain :text "hello" :start 1 :end 1) '(:text "你好"))
+    (should-not crosslang--preview)
+    (crosslang-show-details)
+    (should (buffer-live-p crosslang--preview))
+    (crosslang-dismiss)
+    (should-not crosslang--preview) (should-not crosslang--overlays)
+    (crosslang-mode -1)))
+
+(ert-deftest crosslang-inline-manual-detail-close-removes-inline-too ()
+  (with-temp-buffer
+    (crosslang-mode 1)
+    (crosslang--show '(:operation explain :text "hello" :start 1 :end 1) '(:text "你好"))
+    (crosslang-show-details)
+    (kill-buffer crosslang--preview)
+    (should-not crosslang--proposal) (should-not crosslang--overlays)
+    (crosslang-mode -1)))
+
+(ert-deftest crosslang-inline-invalid-offset-type-safely-rejected ()
+  (should-not (crosslang--valid-edits-p "API 不变" '((:start 4 :end 6))
+                                       '(:text "bad" :edits ((:start "wrong" :end 6 :text "bad"))))))
+
+(ert-deftest crosslang-inline-currency-change-is-not-applied ()
+  (with-temp-buffer
+    (text-mode) (insert "Budget 50 USD") (crosslang-mode 1)
+    (let ((original (buffer-string)))
+      (crosslang--show (list :operation 'express :text original :start 1 :end (point-max)
+                            :tick (buffer-chars-modified-tick)) '(:text "Budget 50 EUR"))
+      (should-error (crosslang-accept) :type 'user-error)
+      (should (equal original (buffer-string))))
+    (crosslang-mode -1)))
